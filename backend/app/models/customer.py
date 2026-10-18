@@ -1,9 +1,10 @@
 from datetime import datetime
 
 from sqlalchemy import DateTime, String
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column,relationship
 
 from app.db.base import Base
+from app.core.clock import utcnow_naive
 
 
 class Customer(Base):
@@ -32,6 +33,10 @@ class Customer(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
+        default=utcnow_naive,
         nullable=False,
+    )
+    tickets = relationship(
+    "Ticket",
+    back_populates="customer",
     )

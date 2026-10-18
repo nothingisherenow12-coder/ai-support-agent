@@ -6,5 +6,9 @@ sqlalchemy
 alembic
 psycopg[binary]
 python-multipart
+groq
+google-genai
+pypdf
+pgvector
 pytest
 httpx

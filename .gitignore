@@ -1,0 +1,17 @@
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies and build output
+node_modules/
+dist/
+build/
+.venv/
+__pycache__/
+.pytest_cache/
+backups/
+
+# Personal sample data accidentally copied into tests
+backend/tests/Jagadeesh_Gowda_AI_Engineer_Resume.pdf

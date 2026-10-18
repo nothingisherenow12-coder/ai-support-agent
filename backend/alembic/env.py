@@ -4,10 +4,18 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from app.db.base import Base
 from app.models.customer import Customer
+from app.models.ticket import Ticket
 
 from alembic import context
 
 from app.core.config import settings
+from app.models.document import Document
+from app.models.document_chunk import DocumentChunk
+from app.models.action import Action
+from app.models.user import User
+from app.models.audit_event import AuditEvent
+from app.models.chat_conversation import ChatConversation
+from app.models.chat_message import ChatMessage
 
 
 # Alembic Config object
@@ -17,7 +25,7 @@ config = context.config
 # Use the same database URL as the application
 config.set_main_option(
     "sqlalchemy.url",
-    settings.database_url,
+    settings.database_url.replace("%", "%%"),
 )
 
 
@@ -28,8 +36,7 @@ if config.config_file_name is not None:
 
 # Metadata for autogenerate
 target_metadata = Base.metadata
-print("ALEMBIC METADATA:", target_metadata)
-print("ALEMBIC TABLES:", target_metadata.tables.keys())
+
 
 def run_migrations_offline() -> None:
     """Run migrations in offline mode."""

@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: ai_support
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/ai_support
+      GEMINI_API_KEY: ci-placeholder
+      AUTH_USERNAME: ci-operator
+      AUTH_PASSWORD: ci-test-password-long
+      AUTH_SECRET_KEY: ci-test-signing-secret-key-with-32-bytes-minimum
+      AUTH_COOKIE_SECURE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements-lock.txt
+      - name: Run migrations
+        run: |
+          cd backend
+          alembic upgrade head
+          alembic check
+      - name: Run non-live tests
+        run: |
+          cd backend
+          python -m scripts.seed_data
+          python -m pytest -q --ignore=tests/test_live_groq.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: |
+          cd frontend
+          npm ci
+      - name: Typecheck and build
+        run: |
+          cd frontend
+          npm run build
