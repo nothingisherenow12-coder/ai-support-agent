@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     auth_cookie_secure: bool = True
     max_upload_bytes: int = 20 * 1024 * 1024
     rag_max_distance:float=0.35
-    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173,https://ai-support-agent-seven.vercel.app"
 
     model_config=SettingsConfigDict(
         env_file=BACKEND_DIR / ".env",
