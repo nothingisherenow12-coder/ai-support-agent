@@ -22,7 +22,7 @@ def create_session(request: LoginRequest, response: Response, db: Session = Depe
         raise
     user = db.execute(select(User).where(User.username == request.username)).scalar_one()
     record_event(db, user, "auth.login_succeeded", "user", user.id)
-    response.set_cookie("support_session", token, max_age=settings.auth_token_ttl_minutes * 60, httponly=True, secure=settings.auth_cookie_secure, samesite="lax", path="/api/v1")
+    response.set_cookie("support_session", token, max_age=settings.auth_token_ttl_minutes * 60, httponly=True, secure=settings.auth_cookie_secure, samesite="none", path="/api/v1")
     return LoginResponse()
 
 
