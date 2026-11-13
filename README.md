@@ -1,349 +1,259 @@
 # AI Support & Operations Agent
 
-An AI-powered support and operations system. A support user asks natural-language
-questions; the system routes them to a grounded knowledge base (RAG), structured
-customer/ticket tools, or a controlled action workflow — where a write operation
-requires explicit human approval before the database changes.
+An internal support workspace that combines a knowledge assistant, customer and ticket tools, bulk data import, and a reviewable action workflow. Support staff can ask questions about uploaded PDF documents, look up customer and ticket records, and prepare supported changes for human review.
 
-Core principle:
+The application is built around a simple rule: **AI can prepare an action, but a person must approve it before it is executed.** The model does not receive direct database access; requests are routed through application code and validated tools.
 
-```text
-AI proposes. Human approves. Backend executes.
-```
+> This repository is an application foundation, not a hosted service. A production deployment still needs operator-managed hosting, secrets, HTTPS, backups, monitoring, and verification against the target database and AI accounts.
 
-The LLM never gets unrestricted database access. It works through explicitly
-defined application tools, and write tools run only after approval.
+## Features
 
----
+- **Knowledge assistant:** Upload text-based PDFs, extract and chunk their text, create Gemini embeddings, search with PostgreSQL and pgvector, and answer from retrieved passages with document citations. Questions without sufficient evidence receive a fixed “not enough information” response.
+- **Customer and ticket workspace:** Search and browse customers and tickets, view a customer’s tickets, create and update supported records, and paginate large result lists.
+- **Bulk CSV import:** Preview and validate customer and ticket files before importing. Duplicate customer emails are skipped. Ticket imports use a stable `external_id` to make retries idempotent.
+- **Action proposals:** The assistant can currently propose ticket creation. Proposals are saved for review; authorized staff can approve or reject them, and only an approved proposal can be executed. Execution is protected against repeated execution and uses a database transaction.
+- **Workspace accounts and roles:** Admins manage accounts and audit events. Admins and agents can use the assistant and manage support data; viewers have read-only access to permitted pages and endpoints. Users can change their password.
+- **Chat history and audit events:** Conversations are saved per user. Audit events record authentication and selected workspace changes without saving chat message content in the audit metadata.
+- **Operations support:** Docker Compose, Alembic migrations, seed scripts, database backup and restore scripts, and GitHub Actions CI are included.
 
-## Architecture
-
-```text
-  React UI (Vite + TypeScript)
-  │  REST (CORS: http://localhost:5173)
-  ▼
-FastAPI
-  ├── POST /api/v1/chat ──► AI Orchestrator ──┬── Knowledge → RAG answer + sources
-  │                                            ├── Data → allow-listed business tool
-  │                                            └── Action → plan + persist proposal
-  ├── POST /api/v1/documents/upload (PDF → chunks → embeddings)
-  ├── POST /api/v1/knowledge/query (direct RAG query)
-  ├── GET  /api/v1/customers/{id}[ /tickets]
-  └── /api/v1/actions ──► propose / list / approve / reject / execute
-                            │
-                     PostgreSQL + pgvector
-```
-
-Mermaid version of the request flow:
+## How it works
 
 ```mermaid
-flowchart TD
-    U[User message] --> C[POST /api/v1/chat]
-    C --> I{Intent classifier}
-    I -->|knowledge| R[pgvector similarity search]
-    R --> G[Grounded Groq answer + sources]
-    I -->|data| T[Tool selector → allow-listed tool → PostgreSQL]
-    I -->|action| P[Action planner → saved proposal: proposed]
-    P --> H{Human approval}
-    H -->|approve| E[Executor: locked, approved-only, exactly-once ticket create]
-    H -->|reject| X[Rejected: no DB change]
+flowchart LR
+    UI[React workspace] --> API[FastAPI REST API]
+    API --> ROUTER{Request type}
+    ROUTER -->|Knowledge| RETRIEVAL[Gemini query embedding + pgvector search]
+    RETRIEVAL --> GROQ[Groq grounded response + citations]
+    ROUTER -->|Data lookup| TOOLS[Allow-listed application tools]
+    TOOLS --> DB[(PostgreSQL + pgvector)]
+    ROUTER -->|Write request| PROPOSAL[Persisted action proposal]
+    PROPOSAL --> REVIEW[Human approval]
+    REVIEW -->|Approved| EXECUTOR[Validated action executor]
+    EXECUTOR --> DB
 ```
 
----
-
-## Request routing
-
-The AI classifies each message as `knowledge`, `data`, or `action`:
-
-* **Knowledge** — e.g. `"What is our refund policy?"` → query embedding →
-  pgvector cosine search → distance threshold (`RAG_MAX_DISTANCE=0.35`) →
-  grounded Groq response with `{answer, sources, answerable}`.
-  Insufficient evidence returns `answerable=false` and a fixed fallback sentence.
-* **Data** — e.g. `"Show me the tickets for customer 1."` → tool selector picks
-  one of `get_customer | get_customer_tickets | get_ticket | list_open_tickets` →
-  validated backend execution → structured result. No SQL from the LLM.
-* **Action** — e.g. `"Create a support ticket for customer 1 …"` → planner builds
-  an `ActionProposal` (currently only `create_ticket`) → persisted with
-  `status=proposed` → returned with `action_id` and `requires_approval=true`.
-
-## RAG pipeline
+### Knowledge workflow
 
 ```text
-PDF upload → suffix check → pypdf extraction → cleaning → chunking (1000/200)
-→ Gemini embeddings (RETRIEVAL_DOCUMENT, 768-d) → PostgreSQL + pgvector
+PDF upload → signature/size checks → pypdf text extraction → chunking
+→ Gemini document embeddings → PostgreSQL/pgvector
+
+Question → Gemini query embedding → nearest chunks → relevance checks
+→ Groq structured, context-grounded answer → answer and source references
 ```
 
-Query time: `RETRIEVAL_QUERY` embedding → cosine-distance top-k →
-threshold filter → strict grounded prompt (context-only, no outside knowledge)
-→ JSON-schema-validated answer + per-chunk sources
-`{document_id, filename, chunk_id, chunk_index, distance}`.
+The current pipeline extracts embedded PDF text; it does not perform OCR on scanned pages. The source PDF itself is not retained: the database stores its filename, content hash, and extracted/indexed chunks.
 
-## Action safety model
+### Action workflow
 
 ```text
-PROPOSED → APPROVED → EXECUTED   (execute allowed only from APPROVED)
-PROPOSED → REJECTED               (terminal; never executes)
+proposed → approved → executed
+    └────→ rejected
 ```
 
-Enforced in backend code, not in prompts:
+The executor only accepts approved proposals, locks the proposal row, and commits the supported write and status transition together. The currently implemented AI write action is `create_ticket`.
 
-* `save_action_proposal` rejects unknown `customer_id` values at propose time (400).
-* `approve_action` re-validates the customer exists (409 on violation).
-* `execute_action(action_id)` locks the row (`SELECT … FOR UPDATE`), requires
-  status `approved` (else 409), creates the ticket and flips to `executed` in
-  **one transaction** — a ticket-creation failure rolls everything back and the
-  action stays `approved` (retryable, never falsely `executed`).
-* Re-execution and execution of proposed/rejected actions return 409.
-* `create_ticket` (write tool) flushes without committing; the caller owns commit,
-  so execution is atomic.
+## Technology
 
----
-
-## API routes
-
-| Method & path | Purpose |
+| Layer | Technology |
 |---|---|
-| `GET /api/v1/health` | Liveness + DB readiness (`database: ok/unreachable`) |
-| `POST /api/v1/auth/login` | Sign in and receive an HttpOnly session cookie |
-| `GET /api/v1/auth/session` | Check the current session |
-| `POST /api/v1/auth/password` | Change password; revokes other sessions |
-| `POST /api/v1/auth/logout` | Clear the session cookie |
-| `POST /api/v1/chat` `{message, context?}` | Unified orchestrator (knowledge / data / action); recent user prompts provide conversational context for knowledge queries |
-| `POST /api/v1/documents/upload` | PDF upload (multipart `file`), returns `{id, filename, chunks_created}` |
-| `GET /api/v1/documents` | List indexed documents (supports `limit`, maximum 500) |
-| `DELETE /api/v1/documents/{id}` | Delete an indexed document and its chunks |
-| `POST /api/v1/knowledge/query` `{question, top_k}` | Direct RAG query |
-| `GET /api/v1/customers/{id}` | Customer record (404 if missing) |
-| `POST /api/v1/customers` | Create a customer (name, unique email, optional company) |
-| `GET /api/v1/customers?limit=&offset=&q=` | Paginated customer directory; response includes `items`, `total`, `limit`, `offset` |
-| `GET /api/v1/customers/{id}/tickets?limit=&offset=` | Paginated customer tickets (404 if customer missing) |
-| `GET /api/v1/tickets?limit=&offset=&status=&priority=&q=` | Paginated, filterable tickets |
-| `POST /api/v1/imports/customers` | Preview/import customer CSV (`dry_run=false` to commit) |
-| `POST /api/v1/imports/tickets` | Preview/import ticket CSV; stable `external_id` makes retries safe |
-| `GET /api/v1/users` / `POST /api/v1/users` | Admin-only team directory and account creation |
-| `GET /api/v1/audit` | Admin-only recent workspace audit events |
-| `POST /api/v1/actions` | Save proposal → 201 `{…, status: proposed}` |
-| `GET /api/v1/actions[?status=]` | List proposals, optional status filter |
-| `GET /api/v1/actions/{id}` | Single proposal (404 if missing) |
-| `POST /api/v1/actions/{id}/approve` | proposed → approved (409 on bad transition) |
-| `POST /api/v1/actions/{id}/reject` | proposed → rejected (409 on bad transition) |
-| `POST /api/v1/actions/{id}/execute` | approved → executed + ticket (409 otherwise) |
+| Frontend | React 19, TypeScript, Vite, React Router, Tailwind CSS, Axios |
+| API | Python 3.12, FastAPI, Pydantic, SQLAlchemy |
+| Database | PostgreSQL 16, pgvector, Alembic |
+| AI | Groq for structured chat completions; Gemini for text embeddings |
+| Documents | pypdf text extraction |
+| Delivery | Docker Compose, Nginx, GitHub Actions |
 
-AI-provider failures are mapped: quota/429 → `503` (+ `Retry-After`), other
-provider errors → `502`. No stack traces leak to clients.
-
-Interactive docs: `http://localhost:8000/docs`.
-
----
-
-## Technology stack
-
-Backend: Python, FastAPI, Pydantic (Groq structured chat output), SQLAlchemy,
-Alembic, PostgreSQL + pgvector, Groq chat, Gemini (`gemini-embedding-2`),
-pypdf, pytest, httpx. Protected endpoints require a signed HttpOnly session cookie.
-Frontend: React 19, TypeScript (strict), Vite 6, React Router 7, Tailwind CSS v4,
-Axios, lucide-react. No Redux; local state + API modules under `src/api/`.
-
-## Project structure
+## Repository layout
 
 ```text
 backend/
   app/
-    main.py                 # FastAPI app + CORS (localhost:5173) + router wiring
-    core/config.py          # database, AI, session, upload and CORS settings
-    db/                     # Base, engine, SessionLocal, get_db
-    models/                 # Customer, Ticket, Document, DocumentChunk, Action
-    schemas/                # customer, ticket, knowledge, document, action,
-                            # intent, tool_call, orchestrator, chat
-    services/               # parser, chunker, embedding, ingestion,
-                            # document_service, retrieval, rag,
-                            # intent_classifier, tool_selector, tool_executor,
-                            # orchestrator, action_planner, action_service,
-                            # action_executor, tools/{customer,ticket,write}_tools
-    routers/                # health, auth, document, knowledge, customers, chat, actions
-  alembic/versions/         # 6 migrations (customers, tickets, documents,
-                            # embeddings, actions) — single head, check-clean
-  scripts/seed_data.py      # 2 customers + 3 tickets (customer 1 = John Smith)
-  tests/                    # backend regression and integration tests (see Testing)
+    core/          Settings, authentication and security helpers
+    db/            SQLAlchemy base, engine and session dependency
+    models/        Users, customers, tickets, documents, chat, audit and actions
+    routers/       FastAPI endpoints
+    schemas/       Request and response validation
+    services/      AI, RAG, ingestion, orchestration and action execution
+  alembic/         Database migration history
+  scripts/         Seed, scale-seed, backup and restore utilities
+  tests/           Backend unit and integration tests
 frontend/
   src/
-    api/                    # client, chat, knowledge, customers, actions
-    components/             # layout, chat, knowledge, customers, actions, common
-    pages/                  # Dashboard, Assistant, KnowledgeBase, Customers, Actions
-    types/                  # action, chat, customer, knowledge
+    api/           Axios client and API modules
+    components/    Shared workspace UI components
+    pages/         Dashboard, assistant, knowledge, customers, tickets, actions and admin
+.github/workflows/ci.yml
+docker-compose.yml
 ```
 
-## Configuration
+## Prerequisites
 
-Backend `backend/.env` (see `backend/.env.example`; never committed):
-
-```env
-DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/ai_support
-GROQ_API_KEY=your_groq_api_key_here
-GEMINI_API_KEY=your_gemini_api_key_here
-RAG_MAX_DISTANCE=0.35
-CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-AUTH_USERNAME=operator
-AUTH_PASSWORD=use_a_long_unique_password
-AUTH_SECRET_KEY=use_at_least_32_random_bytes
-AUTH_TOKEN_TTL_MINUTES=480
-  AUTH_COOKIE_SECURE=false
-```
-
-Copy the root `.env.example` to `.env`. Set `POSTGRES_PASSWORD` there to the same password
-used by `DATABASE_URL`. The database port binds to loopback only. Generate a
-unique auth secret for each deployment; protected routes fail closed until all
-three `AUTH_*` credentials are configured. The current sign-in supports one
-operator account; use an identity provider for multi-user production deployments.
-
-Frontend requests use same-origin `/api` paths by default. Vite proxies them to
-`http://localhost:8000` during development. Set `VITE_API_BASE_URL` only when
-the deployed API has a separate origin, and configure CORS to match.
-
-For a separate API origin, `frontend/.env` may contain:
-
-```env
-VITE_API_BASE_URL=http://localhost:8000
-```
+- Python 3.12 for local backend development
+- Node.js 22 and npm for the frontend
+- Docker Desktop / Docker Engine with Compose for PostgreSQL and the containerized stack
+- A Groq API key for chat and a Gemini API key for embeddings
 
 ## Local development
 
-Requirements: Python 3.12+, Node.js + npm, Docker.
+### 1. Configure the database
 
-```bash
-# 1. Copy .env.example to .env and set a strong POSTGRES_PASSWORD.
-#    Use the same password in backend/.env DATABASE_URL.
-# 2. Database (PostgreSQL 16 + pgvector)
+Copy the root `.env.example` to `.env` and set a strong `POSTGRES_PASSWORD`. The local database port is bound to `127.0.0.1`.
+
+```powershell
+Copy-Item .env.example .env
 docker compose up -d db
+```
 
-# 3. Backend (configure backend/.env from backend/.env.example)
+### 2. Configure and run the API
+
+Copy `backend/.env.example` to `backend/.env`. Set `DATABASE_URL` to use the same password as root `POSTGRES_PASSWORD`; configure fresh AI keys and authentication values. Keep both `.env` files private and out of version control.
+
+```powershell
+Copy-Item backend/.env.example backend/.env
 cd backend
 py -3.12 -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements-lock.txt
 alembic upgrade head
-python -m scripts.seed_data       # idempotent small demo dataset
-python -m scripts.seed_demo_scale # optional: 100 synthetic customers + 300 tickets
-uvicorn app.main:app --reload      # http://localhost:8000, docs at /docs
+python -m scripts.seed_data
+uvicorn app.main:app --reload
+```
 
-# 4. Frontend
+The small seed dataset is for local demonstrations. `python -m scripts.seed_demo_scale` optionally adds synthetic scale-test data; do not use that data as real customer information.
+
+API base URL: `http://localhost:8000`
+
+Interactive API docs: `http://localhost:8000/docs`
+
+Health endpoint: `http://localhost:8000/api/v1/health`
+
+### 3. Run the frontend
+
+```powershell
 cd frontend
-npm install
-npm run dev                        # http://localhost:5173
+npm ci
+npm run dev
 ```
 
-## Containerized workspace
+Open `http://localhost:5173`. Vite proxies `/api` requests to `http://localhost:8000` in local development.
 
-Copy the root `.env.example` to `.env`, set a strong alphanumeric
-`POSTGRES_PASSWORD`, and configure `backend/.env` with the same database
-password plus fresh AI and authentication credentials. Then run:
+## Environment configuration
 
-```bash
+### Backend (`backend/.env`)
+
+The supported settings are shown in `backend/.env.example`:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | SQLAlchemy PostgreSQL connection string |
+| `GROQ_API_KEY` | Groq chat API credential |
+| `GROQ_MODEL` | Groq model identifier |
+| `GROQ_TIMEOUT_SECONDS` | Chat request timeout |
+| `GEMINI_API_KEY` | Gemini embedding API credential |
+| `RAG_MAX_DISTANCE` | Similarity distance cutoff for knowledge retrieval |
+| `AUTH_USERNAME`, `AUTH_PASSWORD`, `AUTH_SECRET_KEY` | Initial admin account configuration and session signing key |
+| `AUTH_TOKEN_TTL_MINUTES` | Session lifetime |
+| `AUTH_COOKIE_SECURE` | Set `true` when served over HTTPS; local HTTP development uses `false` |
+| `MAX_UPLOAD_BYTES` | Maximum PDF upload size (defaults to 20 MiB) |
+| `CORS_ORIGINS` | Comma-separated allowed browser origins |
+
+Authentication bootstraps the first workspace admin from `AUTH_USERNAME` and `AUTH_PASSWORD` when the users table is empty. After that, accounts are managed in the application. The password must be at least 12 characters and the signing secret at least 32 characters.
+
+### Frontend API URL
+
+The Axios client reads `VITE_API_BASE_URL` at **build time**. When it is empty, the client sends `/api/...` requests to the frontend’s own origin; Docker’s Nginx configuration proxies these paths to FastAPI.
+
+For a frontend hosted separately from the API, configure the frontend deployment with the API origin, for example:
+
+```env
+VITE_API_BASE_URL=https://your-api-host.example
+```
+
+The value is the API origin only; API modules append paths such as `/api/v1/auth/login`. After changing a Vite environment variable in a hosted build environment, rebuild and redeploy the frontend so the value is included in the generated bundle. Configure the backend’s `CORS_ORIGINS` for the exact frontend origin. Cross-origin session cookies also require HTTPS, `withCredentials`, and compatible browser cookie policy; test sign-in from the deployed frontend.
+
+## Docker Compose
+
+Configure the root `.env` and `backend/.env` as described above, then run from the repository root:
+
+```powershell
 docker compose up --build -d
+docker compose ps
 ```
 
-Open `http://localhost:8080`. Nginx serves the built frontend, proxies API
-requests to FastAPI, and rate-limits login attempts. The web and database ports
-bind to loopback; the API is internal to the Compose network. This local stack
-does not provision TLS. For a public deployment, terminate HTTPS at a trusted
-edge proxy and enable `AUTH_COOKIE_SECURE=true`. Apply a login rate limit at the
-public edge as well; if Nginx sits behind another proxy, configure trusted real
-IP handling before relying on per-client Nginx limits.
+The workspace is served at `http://localhost:8080`. Nginx serves the static frontend, proxies `/api` to the API container, and rate-limits login requests. The API is internal to the Compose network; database and web ports bind to loopback. Compose does not provide public HTTPS. Put the web service behind a trusted TLS edge proxy before public access and set `AUTH_COOKIE_SECURE=true`.
 
-## Testing
+The API container currently applies Alembic migrations when it starts. For multi-instance production deployments, use a controlled one-time migration job before rolling out API replicas.
 
-```bash
+## API overview
+
+All application routes are under `/api/v1`. Protected routes use the `support_session` HttpOnly cookie.
+
+| Area | Routes |
+|---|---|
+| Health and authentication | `GET /health`, `POST /auth/login`, `GET /auth/session`, `POST /auth/password`, `POST /auth/logout` |
+| Assistant and chat history | `POST /chat`, `GET/POST /chat/conversations`, conversation message listing and deletion |
+| Knowledge documents | `POST /documents/upload`, `GET /documents`, `DELETE /documents/{id}`, `POST /knowledge/query` |
+| Customers and tickets | Paginated customer/ticket listing and supported customer/ticket operations; customer ticket listing |
+| Imports | `POST /imports/customers`, `POST /imports/tickets` |
+| Actions | Create/list/get proposals; approve, reject, and execute supported actions |
+| Administration | Admin-only user management and audit event listing |
+
+For exact request and response schemas, use the generated OpenAPI docs at `/docs` while the API is running.
+
+## Tests and CI
+
+Frontend type-check and production build:
+
+```powershell
+cd frontend
+npm run build
+```
+
+Backend tests require the configured PostgreSQL database and migrated schema:
+
+```powershell
 cd backend
-.venv\Scripts\python.exe -m pytest -q            # full suite (needs DB; live-AI tests need quota)
-.venv\Scripts\python.exe -m pytest -q tests/test_actions_api.py tests/test_chat.py tests/test_rag.py
-cd ../frontend
-npm run typecheck && npm run build
+python -m pytest -q --ignore=tests/test_live_groq.py
 ```
 
-Test strategy: Gemini is mocked in unit tests (deterministic, no quota burn).
-A small set of tests exercises the live provider; they fail with `429` when the
-free-tier quota is exhausted — an environment limit, not a code defect.
-`test_rag.py` was converted from a live script into mocked tests for this reason.
-Real-DB integration tests (actions lifecycle incl. concurrent-execution and
-rollback cases) run against PostgreSQL. CI uses an ephemeral database; for local
-runs, configure `DATABASE_URL` to a dedicated test database before running pytest.
+Live Groq checks are opt-in and may consume provider quota. Run them only when explicitly intended and the required key is configured. GitHub Actions configures PostgreSQL, applies migrations, checks model/schema drift, runs backend tests, and builds the frontend.
 
-## Recruiter demo flow
+## Backups
 
-1. Dashboard → backend reachable.
-2. Knowledge Base → upload a company PDF.
-3. Assistant → `"What is our refund policy?"` → grounded answer + sources.
-4. Assistant → `"Show me the tickets for customer 1."` → structured ticket cards.
-5. Assistant → `"Create a support ticket for customer 1 about a billing problem."`
-   → amber approval card (action persisted as `proposed`).
-6. Approve the proposal, then choose **Execute approved action**; re-execution is refused (409).
-7. Actions page → full queue with approve / reject / execute + history.
+With the Compose database running, create a custom-format database backup:
 
-## Security & limitations (honest)
-
-* Sign-in protects business API routes with expiring signed sessions. Configure
-  strong deployment secrets, set `AUTH_COOKIE_SECURE=true`, and terminate TLS at
-  the public edge. The container Nginx rate-limits login attempts; there is no
-  multi-user identity provider or application-level rate limiter.
-* CORS defaults to `http://localhost:5173` / `127.0.0.1:5173`; set explicit
-  production origins.
-* PDF uploads are limited to 20 MB, checked for a PDF signature, then parsed
-  with pypdf. Malware scanning is not included; production deployments handling
-  untrusted uploads should add scanning at the storage or edge layer.
-* Secrets live in untracked `.env` files; `.env.example` files carry placeholders only.
-* Gemini embedding calls have no explicit client timeout.
-  (Axios uses 60s; backend relies on SDK defaults).
-* Admin, agent, and viewer roles are enforced by the API. Admins can manage
-  accounts, reset passwords, and review the audit log; agents can work tickets
-  and chat; viewers have read-only access. Users can change their own password.
-* Workspace chat history is stored per user. Audit events cover authentication,
-  customer/ticket/document/action/user changes and bulk imports, but do not
-  capture every read or retain chat message contents.
-* Ticket CSV imports require a stable `external_id` to make retries idempotent.
-  Customer emails are unique and existing rows are skipped.
-* The project seed scripts create synthetic demo data. Do not treat it as real
-  customer information or load it into a production workspace.
-
-## Known pending work
-
-* Login throttling is enforced by the bundled Nginx proxy. Directly exposing
-  the API bypasses that limit; public deployments need an edge limit too.
-* Ticket and customer lists use offset pagination. For very large or highly
-  active workspaces, keyset pagination and measured database query tuning may
-  be needed.
-* Audit retention, off-host backup storage, and scheduled restore drills must
-  be configured by the operator for the chosen hosting platform.
-* Datetime columns are stored as naive UTC for compatibility; clients should
-  treat them as UTC until a timezone-aware migration is introduced.
-* There is no frontend unit-test suite yet; CI checks TypeScript and builds the
-  production bundle.
-
-## Backups and recovery
-
-With the Docker Compose database running, create a custom-format backup:
-
-```bash
+```powershell
 python backend/scripts/backup_database.py
 ```
 
-Restore only after stopping application writes and verifying the selected
-backup. The restore script requires typing `RESTORE` because it replaces data:
+Restore requires typing `RESTORE` because it replaces database contents:
 
-```bash
+```powershell
 python backend/scripts/restore_database.py backups/ai-support-YYYYMMDDTHHMMSSZ.dump
 ```
 
-Backups contain customer and workspace data. Keep them encrypted and outside
-GitHub, define a retention schedule, and periodically test restores on a
-separate database before relying on them.
+Backups contain workspace data. Store them encrypted and outside GitHub, set a retention policy, and test restores against a separate database. The repository includes scripts, not a backup schedule or off-site storage service.
 
-## Production launch checklist
+## Security and operational limits
 
-Before opening the service to real users, rotate any credentials previously
-shared in chat, provision fresh database and AI-provider credentials, set an
-explicit production `CORS_ORIGINS`, and set `AUTH_COOKIE_SECURE=true`. Put the
-loopback-bound Compose web service behind a TLS-enabled public edge proxy and
-configure login throttling there. The repository does not include a domain,
-certificate, cloud account, or hosting provider configuration. Apply migrations,
-run CI, confirm backups and restore drills, and keep synthetic seed data out of
-the production database.
+- Rotate any credentials that have been shared outside the secret manager. Never commit `.env` files, API keys, database dumps, or real customer data.
+- Set strong, unique authentication and database secrets. Set `AUTH_COOKIE_SECURE=true` behind HTTPS and use explicit production CORS origins.
+- Login throttling is provided by bundled Nginx; direct exposure of the API bypasses that proxy limit. Configure throttling at the public edge as well.
+- PDF uploads are limited and signature-checked, but malware scanning is not included. Scanned/image-only PDFs are not OCR-processed.
+- The original uploaded PDF is not stored; extracted text chunks and embeddings are persisted in PostgreSQL.
+- Gemini embedding calls currently rely on SDK timeout behavior; an explicit application timeout is not configured.
+- Chat history is stored per user. Audit events cover selected operations, but do not record every read and do not include full chat contents.
+- List endpoints use offset pagination. A frontend unit-test suite is not currently included; CI type-checks and builds the frontend.
+- The application has no domain, TLS certificate, hosting configuration, identity provider, monitoring service, or managed backup target included in this repository.
+
+## Production deployment checklist
+
+Before using real customer data:
+
+1. Revoke and replace exposed credentials; provision production secrets through the host’s secret manager.
+2. Choose and configure the hosting provider, persistent PostgreSQL/pgvector database, domain, and HTTPS edge.
+3. Set exact production `CORS_ORIGINS`, the hosted frontend’s `VITE_API_BASE_URL` when using a separate API origin, and `AUTH_COOKIE_SECURE=true`; rebuild the frontend after changing Vite variables.
+4. Run migrations as a controlled deployment step and verify the database schema.
+5. Configure edge login throttling, monitoring, encrypted off-site backups, retention, and restore drills.
+6. Run CI and database-backed tests, verify login and AI-provider calls from the deployed frontend, and keep synthetic seed data out of production.
